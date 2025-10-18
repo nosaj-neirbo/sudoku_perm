@@ -41,10 +41,14 @@ chmod +x sudoku_perm
 ./sudoku_perm --help
 ```
 
-#### Option B: Editable install
-This repo ships with a `pyproject.toml`. From the project root:
+#### Option B: Application install
 ```bash
-pip install -e .
+sudo apt-get update && sudo apt-get install -y pipx
+pipx ensurepath
+
+# reopen your shell if needed
+pipx install .
+
 sudoku-perm --help
 ```
 
