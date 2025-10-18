@@ -22,7 +22,7 @@ or any logic puzzle requiring controlled digit combination searches.
 ✅ Global & per-length digit filters: `-m`/`--must`, `-x`/`--exclude`, and `--allowed` (via `L<length>:`)  
 ✅ Per-slot candidate constraints: `--slots`  
 ✅ Pinned positions: `--pin` (fix position=value and print results with pinned digits placed; others ascend)  
-✅ Assignments: `--show-assignmen`t prints one valid placement (when `--slots`/`--pin` are present)  
+✅ Assignments: `--show-assignment` prints one valid placement (when `--slots`/`--pin` are present)  
 ✅ Assignments: `--all-fits` prints all valid placements; CSV/JSON include assignments in this mode  
 ✅ Grouping by length (or flat with `--flat`), counts-only summaries, colorized text  
 ✅ `--cage` helper: per-slot minima/maxima & digit frequency  
