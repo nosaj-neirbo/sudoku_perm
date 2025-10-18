@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""
+sudoku_perm — Killer Sudoku & Kakuro Permutations (CLI)
+- a fast, intuitive command-line tool for Sudoku, Killer Sudoku, and Kakuro puzzle solvers.
+
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from typing import Dict, List, Tuple, Optional, Set
+
+DIGITS: Tuple[int, ...] = tuple(range(1, 10))
+__version__ = "1.4.1"
+
+# -----------------------------------------------------------------------------
+# Formatting helpers
+# -----------------------------------------------------------------------------
+
+def colorize(enabled: bool, text: str, role: str) -> str:
+    COLORS = {
+        'hdr':   '\x1b[1;36m',
+        'muted': '\x1b[2;37m',
+        'ok':    '\x1b[1;32m',
+        'warn':  '\x1b[1;33m',
+        'err':   '\x1b[1;31m',
+        'reset': '\x1b[0m',
+    }
+    if not enabled:
+        return text
+    return f"{COLORS.get(role, '')}{text}{COLORS['reset']}"
+
+def split_csv_space(s: str) -> List[str]:
+    out: List[str] = []
+    for part in s.split(','):
+        part = part.strip()
+        if part:
+            out.append(part)
+    return out
+
+# -----------------------------------------------------------------------------
+# Parsing helpers
+# -----------------------------------------------------------------------------
+
+def parse_digits_list(values: List[str]) -> List[int]:
+    out: List[int] = []
+    for v in values or []:
+        for ch in split_csv_space(v):
+            if not ch.isdigit():
+                raise argparse.ArgumentTypeError(f"Invalid digit '{ch}'. Must be 1-9.")
+            d = int(ch)
+            if not (1 <= d <= 9):
+                raise argparse.ArgumentTypeError(f"Digit out of range: {d}. Must be 1-9.")
+            out.append(d)
+    return out
+
+def parse_range_or_digit(term: str) -> List[int]:
+    term = term.strip()
+
+    if '-' in term:
+        a_s, b_s = term.split('-', 1)
+        if not (a_s.isdigit() and b_s.isdigit()):
+            raise argparse.ArgumentTypeError(f"Invalid range '{term}'.")
+        a, b = int(a_s), int(b_s)
+        if not (1 <= a <= b <= 9):
+            raise argparse.ArgumentTypeError(f"Range '{term}' out of bounds.")
+        return list(range(a, b + 1))
+
+    if not term.isdigit():
+        raise argparse.ArgumentTypeError(f"Invalid digit '{term}'.")
+    d = int(term)
+    if not (1 <= d <= 9):
+        raise argparse.ArgumentTypeError(f"Digit out of range: {d}.")
+    return [d]
+
+def parse_digits_or_ranges_terms(s: str) -> List[int]:
+    """
+    Accepts '1', '1,3,5', '2-6', or mixtures like '1,4-6,9'
+    and returns the expanded list of ints.
+    """
+    out: List[int] = []
+    for term in s.split(','):
+        term = term.strip()
+        if not term:
+            continue
+        out.extend(parse_range_or_digit(term))  # already validates 1..9, and ranges
+    return out
+
+def parse_dupes_tokens(tokens: List[str]) -> Tuple[Optional[int], Dict[int, int]]:
+    """Parse dupes tokens for a single context (global or per-length)."""
+    if not tokens:
+        return (None, {})
+
+    global_cap: Optional[int] = None
+    per_caps: Dict[int, int] = {}
+
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+
+        # Single number => global cap
+        if ':' not in tok:
+            if not tok.isdigit():
+                raise argparse.ArgumentTypeError(f"Invalid dupes token '{tok}'.")
+            N = int(tok)
+            if N < 1:
+                raise argparse.ArgumentTypeError("Global cap must be >= 1.")
+            if global_cap is not None:
+                raise argparse.ArgumentTypeError(f"'--dupes' may specify only one global cap (found both {global_cap} and {N}).")
+            global_cap = N
+            continue
+
+        # LHS:RHS
+        left, right = tok.split(':', 1)
+        left, right = left.strip(), right.strip()
+
+        # G:N => global cap
+        if left.upper() == 'G':
+            if not right.isdigit():
+                raise argparse.ArgumentTypeError(f"Invalid global cap 'G:{right}'.")
+            N = int(right)
+            if N < 1:
+                raise argparse.ArgumentTypeError("Global cap must be >= 1.")
+            if global_cap is not None:
+                raise argparse.ArgumentTypeError(f"'--dupes' may specify only one global cap (found both {global_cap} and G:{N}).")
+            global_cap = N
+            continue
+
+        if not right.isdigit():
+            raise argparse.ArgumentTypeError(f"Invalid cap '{right}' in token '{tok}'.")
+        C = int(right)
+        if C < 0:
+            raise argparse.ArgumentTypeError(f"Cap must be >= 0 in token '{tok}'.")
+
+        digits: List[int] = []
+        for term in left.split(','):
+            term = term.strip()
+            if not term:
+                raise argparse.ArgumentTypeError("Empty digit term before ':'.")
+            digits.extend(parse_range_or_digit(term))
+
+        for d in digits:
+            per_caps[d] = C
+
+    return (global_cap, per_caps)
+
+def parse_labeled_digits(tokens: List[str], lengths: List[int]) -> Tuple[List[int], Dict[int, List[int]]]:
+    """Parse -m/--must, -x/--exclude, --allowed (as digits) with optional L<length>: labels."""
+    global_list: List[int] = []
+    per: Dict[int, List[int]] = {}
+
+    if not tokens:
+        return (global_list, per)
+
+    ls = set(lengths)
+    multi = len(ls) > 1
+    current_len: Optional[int] = None if multi else lengths[0]
+
+    def ensure_len(L: int) -> None:
+        if L not in ls:
+            raise argparse.ArgumentTypeError(f"Refers to L{L} but lengths are {sorted(ls)}")
+        if L not in per:
+            per[L] = []
+
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+ 
+        if tok.upper().startswith('L') and ':' in tok:
+            head, rest = tok.split(':', 1)
+            try:
+                L = int(head[1:])
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid length label '{head}'. Use L<length>:...")
+        
+            ensure_len(L)
+            current_len = L
+            # 'rest' may contain ranges and/or comma lists (e.g., '1-9' or '1,3,5')
+            for part in rest.split():
+                for d in parse_digits_or_ranges_terms(part):
+                    per[L].append(d)
+            continue
+ 
+        if multi and current_len is not None:
+            for part in tok.split():
+                for d in parse_digits_or_ranges_terms(part):
+                    per[current_len].append(d)
+        else:
+            for d in parse_digits_or_ranges_terms(tok):
+                global_list.append(d)
+
+    return (global_list, per)
+
+def parse_labeled_dupes(all_tokens: List[List[str]] | None, lengths: List[int]) -> Tuple[Tuple[Optional[int], Dict[int, int]], Dict[int, Tuple[Optional[int], Dict[int, int]]]]:
+    """Parse --dupes with optional per-length L<length> labels."""
+    global_tokens: List[str] = []
+    per_tokens: Dict[int, List[str]] = {}
+
+    # Flatten one level from argparse append
+    flat: List[str] = []
+    if all_tokens:
+        for part in all_tokens:
+            if part:
+                flat.extend(part)
+
+    ls = set(lengths)
+    multi = len(ls) > 1
+    current_len: Optional[int] = None if multi else None
+
+    def ensure_len(L: int) -> None:
+        if L not in ls:
+            raise argparse.ArgumentTypeError(f"--dupes refers to L{L} but lengths are {sorted(ls)}")
+        if L not in per_tokens:
+            per_tokens[L] = []
+
+    i = 0
+    while i < len(flat):
+        tok = flat[i].strip()
+        if not tok:
+            i += 1
+            continue
+
+        if tok.upper().startswith('L') and ':' in tok:
+            head, rest = tok.split(':', 1)
+            try:
+                current_len = int(head[1:])
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid length label '{head}'. Use L<length>:...")
+            ensure_len(current_len)
+            per_tokens[current_len].append(rest)
+            i += 1
+            # consume contiguous tokens for this L-context
+            while i < len(flat) and not (flat[i].upper().startswith('L') and ':' in flat[i]):
+                per_tokens[current_len].append(flat[i])
+                i += 1
+            continue
+
+        global_tokens.append(tok)
+        i += 1
+
+    global_ctx = parse_dupes_tokens(global_tokens)
+    per_len_ctx: Dict[int, Tuple[Optional[int], Dict[int, int]]] = {}
+    for L, toks in per_tokens.items():
+        per_len_ctx[L] = parse_dupes_tokens(toks)
+
+    # Validation: per-length cannot exceed global cap (tightening only)
+    gcap, gmap = global_ctx
+    for L, (lc, lm) in per_len_ctx.items():
+        if gcap is not None and lc is not None and lc > gcap:
+            raise argparse.ArgumentTypeError(f"For L{L}, per-length global dupes cap {lc} exceeds global cap {gcap}.")
+        for d, c in lm.items():
+            g_for_d = gmap.get(d, gcap if gcap is not None else 1)
+            if c > g_for_d:
+                raise argparse.ArgumentTypeError(f"For L{L}, dupes cap {d}:{c} exceeds global cap for digit ({g_for_d}).")
+
+    return global_ctx, per_len_ctx
+
+# -----------------------------------------------------------------------------
+# Core search & pruning
+# -----------------------------------------------------------------------------
+
+def min_possible_sum(caps: Dict[int, int], L: int) -> int:
+    pool: List[int] = []
+    for d in range(1, 10):
+        pool.extend([d] * caps.get(d, 0))
+    pool.sort()
+    return sum(pool[:L]) if len(pool) >= L else float('inf')
+
+def max_possible_sum(caps: Dict[int, int], L: int) -> int:
+    pool: List[int] = []
+    for d in range(1, 10):
+        pool.extend([d] * caps.get(d, 0))
+    pool.sort(reverse=True)
+    return sum(pool[:L]) if len(pool) >= L else float('-inf')
+
+def backtrack(digits: Tuple[int, ...],
+              idx: int,
+              target_len: int,
+              target_sum: int,
+              caps: Dict[int, int],
+              must_counts: Dict[int, int],
+              cur: List[int],
+              results: List[Tuple[int, ...]],
+              rl: int,
+              rs: int) -> None:
+    if rl > target_len or rs > target_sum:
+        return
+
+    if idx == len(digits):
+        if rl == target_len and rs == target_sum and all(c <= 0 for c in must_counts.values()):
+            results.append(tuple(cur))
+        return
+
+    d = digits[idx]
+    cap = caps.get(d, 0)
+    min_needed = max(0, must_counts.get(d, 0))
+
+    rem_len = target_len - rl
+    rem_sum = target_sum - rs
+
+    max_take = min(cap, rem_len, (rem_sum // d) if d > 0 else cap)
+
+    if min_needed > max_take:
+        return
+
+    for take in range(min_needed, max_take + 1):
+        new_must = must_counts
+        if min_needed > 0:
+            new_must = dict(must_counts)
+            new_must[d] = min_needed - min(take, min_needed)
+
+        if take:
+            cur.extend([d] * take)
+
+        backtrack(digits, idx + 1, target_len, target_sum, caps, new_must, cur, results, rl + take, rs + d * take)
+
+        if take:
+            del cur[-take:]
+
+def find_combos_for_length(total_sum: int, L: int, caps: Dict[int, int], must: List[int]) -> List[Tuple[int, ...]]:
+    lo = min_possible_sum(caps, L)
+    hi = max_possible_sum(caps, L)
+    if not (lo <= total_sum <= hi):
+        return []
+
+    must_counts = Counter(must)
+    for d in must_counts:
+        if caps.get(d, 0) == 0:
+            return []
+
+    active = tuple(d for d in DIGITS if caps.get(d, 0) > 0)
+
+    res: List[Tuple[int, ...]] = []
+    backtrack(active, 0, L, total_sum, caps, dict(must_counts), [], res, 0, 0)
+    res.sort()
+    return res
+
+# -----------------------------------------------------------------------------
+# Slots, Pins, Assignments
+# -----------------------------------------------------------------------------
+
+def parse_slots(tokens: List[str], lengths: List[int]) -> Dict[int, List[Set[int]]]:
+    if not tokens:
+        return {}
+
+    ls = set(lengths)
+    multi = len(ls) > 1
+    res: Dict[int, List[Set[int]]] = {}
+    current_len: Optional[int] = None
+
+    def ensure_len(L: int) -> None:
+        if L not in ls:
+            raise argparse.ArgumentTypeError(f"--slots refers to L{L} but lengths are {sorted(ls)}")
+        if L not in res:
+            res[L] = []
+
+    if multi:
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+
+            if tok.upper().startswith('L') and ':' in tok:
+                head, rest = tok.split(':', 1)
+                try:
+                    current_len = int(head[1:])
+                except ValueError:
+                    raise argparse.ArgumentTypeError(f"Invalid length label '{head}'. Use L<length>:...")
+                ensure_len(current_len)
+                pos_digits = rest
+            else:
+                if current_len is None:
+                    raise argparse.ArgumentTypeError("In multi-length mode, start with 'L<length>:pos:digits'.")
+                pos_digits = tok
+
+            if ':' not in pos_digits:
+                raise argparse.ArgumentTypeError(f"Invalid --slots token '{tok}'. Expected 'pos:digits'.")
+            pos_s, digs_s = pos_digits.split(':', 1)
+
+            if not pos_s.isdigit():
+                raise argparse.ArgumentTypeError(f"Invalid position '{pos_s}'.")
+            pos = int(pos_s)
+            if pos <= 0:
+                raise argparse.ArgumentTypeError("Positions are 1-indexed and must be >= 1.")
+
+            while len(res[current_len]) < pos:
+                res[current_len].append(set(DIGITS))
+
+            cand: Set[int] = set()
+            for term in digs_s.split(','):
+                for d in parse_range_or_digit(term):
+                    cand.add(d)
+            res[current_len][pos - 1] = cand
+            i += 1
+
+    else:
+        L = lengths[0]
+        res[L] = []
+
+        for tok in tokens:
+            if ':' not in tok:
+                raise argparse.ArgumentTypeError(f"Invalid --slots token '{tok}'. Expected 'pos:digits'.")
+            pos_s, digs_s = tok.split(':', 1)
+
+            if not pos_s.isdigit():
+                raise argparse.ArgumentTypeError(f"Invalid position '{pos_s}'.")
+            pos = int(pos_s)
+            if pos <= 0 or pos > L:
+                raise argparse.ArgumentTypeError(f"Position {pos} out of range for length {L}.")
+
+            while len(res[L]) < pos:
+                res[L].append(set(DIGITS))
+
+            cand: Set[int] = set()
+            for term in digs_s.split(','):
+                for d in parse_range_or_digit(term):
+                    cand.add(d)
+            res[L][pos - 1] = cand
+
+    for L, slots in res.items():
+        if len(slots) != L:
+            raise argparse.ArgumentTypeError(f"--slots for L{L} must specify exactly {L} positions (got {len(slots)}).")
+        for i, s in enumerate(slots, start=1):
+            if not s:
+                raise argparse.ArgumentTypeError(f"--slots L{L}: position {i} has empty candidate set.")
+
+    return res
+
+def parse_pins(tokens: List[str], lengths: List[int]) -> Dict[int, Dict[int, int]]:
+    pins: Dict[int, Dict[int, int]] = {}
+    if not tokens:
+        return pins
+
+    ls = set(lengths)
+    multi = len(ls) > 1
+    current_len: Optional[int] = None if multi else lengths[0]
+
+    def ensure_len(L: int) -> None:
+        if L not in ls:
+            raise argparse.ArgumentTypeError(f"--pin refers to L{L} but lengths are {sorted(ls)}")
+        if L not in pins:
+            pins[L] = {}
+
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+
+        if tok.upper().startswith('L') and ':' in tok:
+            head, rest = tok.split(':', 1)
+            try:
+                Lctx = int(head[1:])
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid length label '{head}'. Use L<length>:...")
+            ensure_len(Lctx)
+            current_len = Lctx
+            tok2 = rest
+        else:
+            if current_len is None:
+                raise argparse.ArgumentTypeError("In multi-length mode, start with 'L<length>:pos=digit'.")
+            tok2 = tok
+
+        if '=' not in tok2:
+            raise argparse.ArgumentTypeError(f"Invalid --pin token '{tok}'. Expected 'pos=digit'.")
+        pos_s, dig_s = tok2.split('=', 1)
+
+        if not pos_s.isdigit() or not dig_s.isdigit():
+            raise argparse.ArgumentTypeError(f"Invalid --pin token '{tok}'.")
+        pos = int(pos_s)
+        d = int(dig_s)
+
+        if not (1 <= d <= 9):
+            raise argparse.ArgumentTypeError(f"Pinned digit out of range: {d}.")
+        if pos <= 0:
+            raise argparse.ArgumentTypeError("Positions are 1-indexed and must be >= 1.")
+
+        pins[current_len][pos] = d
+
+    return pins
+
+def merge_pins_into_slots(pins, slots, lengths):
+    if not pins:
+        return slots
+
+    res = {L: [set(s) for s in slots.get(L, [set(DIGITS) for _ in range(L)])] for L in lengths}
+
+    for L, mapping in pins.items():
+        if L not in res:
+            res[L] = [set(DIGITS) for _ in range(L)]
+
+        for pos, d in mapping.items():
+            if pos <= 0 or pos > L:
+                raise argparse.ArgumentTypeError(f"--pin L{L}:{pos} out of range for length {L}.")
+            idx = pos - 1
+
+            if res[L][idx] and d not in res[L][idx]:
+                raise ValueError(f"--pin L{L}:{pos}={d} conflicts with --slots candidates {sorted(res[L][idx])}.")
+
+            res[L][idx] = {d}
+
+    return res
+
+def enumerate_assignments_all(combo: Tuple[int, ...], slot_sets: List[Set[int]]) -> List[List[int]]:
+    L = len(combo)
+    digits = list(combo)
+    used = [False] * L
+    assignment = [None] * L
+
+    # Small heuristic: assign most constrained slot first
+    order = sorted(range(L), key=lambda i: len(slot_sets[i]))
+    out: List[List[int]] = []
+
+    def dfs(k: int) -> None:
+        if k == L:
+            out.append(assignment.copy())
+            return
+
+        i = order[k]
+        allowed = slot_sets[i]
+        last_val = None
+
+        for idx in range(L):
+            if used[idx]:
+                continue
+            d = digits[idx]
+            if d == last_val:
+                continue
+            if d in allowed:
+                used[idx] = True
+                assignment[i] = d
+                dfs(k + 1)
+                used[idx] = False
+                last_val = d
+
+    dfs(0)
+    return out
+
+def find_one_assignment(combo: Tuple[int, ...], slot_sets: List[Set[int]]) -> Optional[List[int]]:
+    fits = enumerate_assignments_all(combo, slot_sets)
+    return fits[0] if fits else None
+
+def apply_pins_for_display(combo: Tuple[int, ...], pins_for_L: Dict[int, int]) -> List[int]:
+    L = len(combo)
+
+    if not pins_for_L:
+        return list(combo)
+
+    counts = Counter(combo)
+    display = [None] * L
+
+    # Place pins
+    for pos, d in pins_for_L.items():
+        idx = pos - 1
+        display[idx] = d
+        counts[d] -= 1
+        if counts[d] < 0:
+            # If inconsistent, fall back to raw combo
+            return list(combo)
+
+    # Fill the rest with remaining digits in ascending order
+    remaining: List[int] = []
+    for d in range(1, 10):
+        remaining.extend([d] * max(0, counts[d]))
+    remaining.sort()
+
+    it = iter(remaining)
+    for i in range(L):
+        if display[i] is None:
+            display[i] = next(it, None)
+
+    return display
+
+# -----------------------------------------------------------------------------
+# Cage stats
+# -----------------------------------------------------------------------------
+
+def cage_stats(combos: List[Tuple[int, ...]], length: int):
+    if not combos:
+        return {'slot_min': [], 'slot_max': [], 'digit_freq': {d: 0 for d in DIGITS}}
+
+    slot_min = [min(t[i] for t in combos) for i in range(length)]
+    slot_max = [max(t[i] for t in combos) for i in range(length)]
+
+    freq = Counter()
+    for t in combos:
+        freq.update(t)
+
+    return {
+        'slot_min': slot_min,
+        'slot_max': slot_max,
+        'digit_freq': {d: freq.get(d, 0) for d in DIGITS},
+    }
+
+# -----------------------------------------------------------------------------
+# Renderers
+# -----------------------------------------------------------------------------
+
+def summarize_caps(caps: Dict[int, int]) -> str:
+    pairs = [f"{d}:{caps.get(d, 0)}" for d in range(1, 10)]
+    return '{' + ', '.join(pairs) + '}'
+
+def format_text(sum_val: int,
+                lengths: List[int],
+                results_by_len,
+                counts_only: bool,
+                color: bool,
+                cage: bool,
+                slot_assignments_one=None,
+                slot_assignments_all=None,
+                show_assignment: bool = False,
+                all_fits: bool = False,
+                flat: bool = False,
+                pin_map=None,
+                explain: Optional[Dict[int, str]] = None,
+                header_prefix: str = "") -> str:
+    lines: List[str] = []
+
+    multi_length = len(lengths) > 1
+    grouping_relevant = (multi_length) or (all_fits)
+    use_grouping = (not flat) and grouping_relevant
+
+    if not flat:
+        total = sum(len(v) for v in results_by_len.values())
+        hdr = f"{header_prefix}=== Sudoku Combos: Sum {sum_val} | Lengths {', '.join(map(str, lengths))} | Total {total} ==="
+        lines.append(colorize(color, hdr, 'hdr'))
+        lines.append('')
+
+    for L in lengths:
+        combos = results_by_len.get(L, [])
+
+        if use_grouping:
+            if counts_only:
+                lines.append(f"Length {L}: {len(combos)} combos")
+                lines.append('')
+                continue
+
+            head = f"{header_prefix}── Sum {sum_val} · Length {L} · {len(combos)} combo(s) ──"
+            lines.append(colorize(color, head, 'muted'))
+
+        if explain and L in explain:
+            lines.append(explain[L])
+
+        if counts_only:
+            if not use_grouping:
+                lines.append(f"Length {L}: {len(combos)} combos")
+                lines.append('')
+            continue
+
+        pins_for_L = (pin_map or {}).get(L, {})
+
+        for t in combos:
+            disp = apply_pins_for_display(t, pins_for_L)
+            inner = ' '.join(str(x) for x in disp)
+
+            if all_fits and slot_assignments_all and L in slot_assignments_all:
+                fits = slot_assignments_all[L].get(t, [])
+                if use_grouping:
+                    lines.append(f"  [ {inner} ]")
+                    for a in fits:
+                        asn = ', '.join(f"s{i+1}={a[i]}" for i in range(L))
+                        lines.append(f"    -> {asn}")
+                else:
+                    for a in fits:
+                        asn = ', '.join(f"s{i+1}={a[i]}" for i in range(L))
+                        lines.append(f"[ {inner} ] -> {asn}")
+
+            elif show_assignment and slot_assignments_one and L in slot_assignments_one:
+                a = slot_assignments_one[L].get(t)
+                if a:
+                    asn = ', '.join(f"s{i+1}={a[i]}" for i in range(L))
+                    if use_grouping:
+                        lines.append(f"  [ {inner} ] -> {asn}")
+                    else:
+                        lines.append(f"[ {inner} ] -> {asn}")
+                else:
+                    if use_grouping:
+                        lines.append(f"  [ {inner} ] (no slot fit)")
+                    else:
+                        lines.append(f"[ {inner} ] (no slot fit)")
+            else:
+                if use_grouping:
+                    lines.append(f"  [ {inner} ]")
+                else:
+                    lines.append(f"[ {inner} ]")
+
+        if cage and use_grouping:
+            st = cage_stats(combos, L)
+            lines.append('')
+            lines.append(colorize(color, '  Cage helper:', 'ok'))
+            lines.append(f"   • per-slot min: {st['slot_min']}")
+            lines.append(f"   • per-slot max: {st['slot_max']}")
+            used = {d: c for d, c in st['digit_freq'].items() if c > 0}
+            lines.append(f"   • digit frequency: {used if used else {}}")
+
+        if use_grouping:
+            lines.append('')
+
+    return '\n'.join(lines).rstrip()
+
+def format_csv(sum_val: int,
+               lengths: List[int],
+               results_by_len,
+               pin_map=None,
+               include_assignments: bool = False,
+               slot_assignments_all=None) -> str:
+    rows: List[str] = []
+
+    if include_assignments:
+        rows.append("sum,length,combo,assignment")
+    else:
+        rows.append("sum,length,combo")
+
+    for L in lengths:
+        pins_for_L = (pin_map or {}).get(L, {})
+
+        for t in results_by_len.get(L, []):
+            disp = apply_pins_for_display(t, pins_for_L)
+            combo_str = ' '.join(map(str, disp))
+
+            if include_assignments and slot_assignments_all:
+                fits = (slot_assignments_all.get(L, {})).get(t, [])
+                if not fits:
+                    rows.append(f"{sum_val},{L},\"{combo_str}\",\"\"")
+                else:
+                    for a in fits:
+                        asn = ', '.join(f"s{i+1}={a[i]}" for i in range(L))
+                        rows.append(f"{sum_val},{L},\"{combo_str}\",\"{asn}\"")
+            else:
+                rows.append(f"{sum_val},{L},\"{combo_str}\"")
+
+    return '\n'.join(rows)
+
+def format_json(sum_val: int,
+                lengths: List[int],
+                results_by_len,
+                include_cage: bool = False,
+                pin_map=None,
+                include_assignments: bool = False,
+                slot_assignments_all=None) -> str:
+    data = {'sum': sum_val, 'lengths': lengths, 'groups': []}
+
+    for L in lengths:
+        combos = results_by_len.get(L, [])
+        pins_for_L = (pin_map or {}).get(L, {})
+        disp_list = [apply_pins_for_display(t, pins_for_L) for t in combos]
+
+        group = {'length': L, 'count': len(combos), 'combos': disp_list}
+
+        if include_cage:
+            group['cage'] = cage_stats(combos, L)
+
+        if include_assignments and slot_assignments_all:
+            asn_map = slot_assignments_all.get(L, {})
+            group['assignments'] = [
+                [f"s{i+1}={a[i]}" for i in range(L)]
+                for t in combos
+                for a in asn_map.get(t, [])
+            ]
+
+        data['groups'].append(group)
+
+    import json
+    return json.dumps(data, indent=2)
+
+# -----------------------------------------------------------------------------
+# Compute-and-render for one sum
+# -----------------------------------------------------------------------------
+
+def compute_and_render_for_sum(sum_val: int,
+                               lengths: List[int],
+                               args,
+                               use_color: bool,
+                               header_prefix: str = "") -> str:
+    # Base caps from global dupes
+    (g_dupes_cap, g_dupes_map), per_len_dupes = parse_labeled_dupes(args.dupes, lengths)
+
+    base_caps = {d: 1 for d in DIGITS}
+    if g_dupes_cap is not None:
+        for d in base_caps:
+            base_caps[d] = g_dupes_cap
+
+    for d, c in g_dupes_map.items():
+        base_caps[d] = c
+
+    # Allowed (global + per-length tightens)
+    allowed_global, allowed_map = parse_labeled_digits(args.allowed, lengths)
+
+    if allowed_global:
+        allowed_set = set(allowed_global)
+        for d in list(base_caps.keys()):
+            if d not in allowed_set:
+                base_caps[d] = 0
+
+    # Global must/exclude (with per-length versions)
+    must_global, must_map = parse_labeled_digits(args.must, lengths)
+    excl_global, excl_map = parse_labeled_digits(args.exclude, lengths)
+
+    # Slots & pins (shared for all lengths of this sum)
+    raw_slots: List[str] = []
+    for part in (args.slots or []):
+        if part:
+            raw_slots.extend(part)
+    slot_map = parse_slots(raw_slots, lengths) if raw_slots else {}
+
+    raw_pins: List[str] = []
+    for part in (args.pin or []):
+        if part:
+            raw_pins.extend(part)
+    pin_map = parse_pins(raw_pins, lengths) if raw_pins else {}
+
+    if pin_map:
+        slot_map = merge_pins_into_slots(pin_map, slot_map, lengths)
+
+    results_by_len: Dict[int, List[Tuple[int, ...]]] = {}
+    all_one = {}
+    all_all = {}
+    explain_lines: Dict[int, str] = {}
+
+    for L in lengths:
+        caps_L = dict(base_caps)
+
+        # Apply per-length allowed tightening
+        if allowed_map.get(L):
+            allowed_set = set(allowed_map[L])
+            for d in range(1, 10):
+                if d not in allowed_set:
+                    caps_L[d] = 0
+
+        # Apply per-length dupes tightening
+        lcap, lmap = per_len_dupes.get(L, (None, {}))
+        if lcap is not None:
+            for d in caps_L:
+                caps_L[d] = min(caps_L[d], lcap)
+        for d, c in lmap.items():
+            caps_L[d] = min(caps_L.get(d, 0), c)
+
+        # Excludes (global + per-length)
+        for d in excl_global:
+            caps_L[d] = 0
+        for d in excl_map.get(L, []):
+            caps_L[d] = 0
+
+        # Must list per length
+        must_L = list(must_global) + list(must_map.get(L, []))
+
+        # If any required digit is unavailable (excluded or capped to 0), exit with "required" in the message.
+        missing_required = sorted({d for d in must_L if caps_L.get(d, 0) == 0})
+        if missing_required:
+            raise SystemExit(
+                f"required digit(s) {missing_required} are excluded or capped to 0 for length {L}."
+            )
+
+        # If any required digit cannot appear in ANY slot, exit with phrase "cannot fit any slot".
+        if L in slot_map:
+            slot_sets = slot_map[L]
+            cannot_fit = sorted({d for d in must_L if not any(d in s for s in slot_sets)})
+            if cannot_fit:
+                raise SystemExit(
+                    f"--must {cannot_fit} cannot fit any slot for length {L}."
+                )
+
+        # Find combos
+        combos = find_combos_for_length(sum_val, L, caps_L, must_L)
+
+        # Slot filtering & assignment collection
+        one_map = {}
+        all_map = {}
+
+        if L in slot_map:
+            slot_sets = slot_map[L]
+            keep = []
+
+            if args.all_fits:
+                for t in combos:
+                    fits = enumerate_assignments_all(t, slot_sets)
+                    if fits:
+                        keep.append(t)
+                        all_map[t] = fits
+                        one_map[t] = fits[0]
+            else:
+                for t in combos:
+                    a = find_one_assignment(t, slot_sets)
+                    if a:
+                        keep.append(t)
+                        one_map[t] = a
+
+            combos = keep
+
+        results_by_len[L] = combos
+        all_one[L] = one_map
+        all_all[L] = all_map
+
+        # Build explain line
+        parts = []
+
+        allowed_eff = [d for d in range(1, 10) if caps_L.get(d, 0) > 0]
+        parts.append(f"    allowed={allowed_eff}")
+        parts.append(f"    caps={summarize_caps(caps_L)}")
+        parts.append(f"    must={sorted(must_L)}")
+        exL = sorted(set(excl_global).union(excl_map.get(L, [])))
+        parts.append(f"    exclude={exL}")
+
+        pin_str = {pos: pin_map[L][pos] for pos in sorted(pin_map.get(L, {}))} if pin_map else {}
+        parts.append(f"    pins={pin_str}")
+
+        if L in slot_map:
+            slot_summ = []
+            for idx, s in enumerate(slot_map[L], start=1):
+                slot_summ.append(f"s{idx}:{sorted(s)}")
+            parts.append("    slots={" + "; ".join(slot_summ) + "}")
+        else:
+            parts.append("    slots={} ")
+
+        explain_lines[L] = "\n".join(parts)
+
+    # Output
+    if args.format == 'text':
+        return format_text(sum_val,
+                           lengths,
+                           results_by_len,
+                           counts_only=args.counts_only,
+                           color=use_color,
+                           cage=args.cage,
+                           slot_assignments_one=all_one,
+                           slot_assignments_all=all_all,
+                           show_assignment=(args.show_assignment or args.all_fits),
+                           all_fits=args.all_fits,
+                           flat=args.flat,
+                           pin_map=pin_map,
+                           explain=(explain_lines if args.explain else None),
+                           header_prefix=header_prefix)
+
+    include_assign = args.all_fits
+
+    if args.format == 'csv':
+        return format_csv(sum_val,
+                          lengths,
+                          results_by_len,
+                          pin_map=pin_map,
+                          include_assignments=include_assign,
+                          slot_assignments_all=all_all)
+
+    return format_json(sum_val,
+                       lengths,
+                       results_by_len,
+                       include_cage=args.cage,
+                       pin_map=pin_map,
+                       include_assignments=include_assign,
+                       slot_assignments_all=all_all)
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def parse_sums_range(tokens: List[str]) -> List[int]:
+    out: List[int] = []
+    for tok in tokens:
+        for piece in split_csv_space(tok):
+            if '-' in piece:
+                a, b = piece.split('-', 1)
+                if not (a.isdigit() and b.isdigit()):
+                    raise argparse.ArgumentTypeError(f"Invalid sum range '{piece}'.")
+                out.extend(range(int(a), int(b) + 1))
+            else:
+                if not piece.isdigit():
+                    raise argparse.ArgumentTypeError(f"Invalid sum '{piece}'. Must be a positive integer.")
+                out.append(int(piece))
+    return sorted(set(out))
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sudoku_perm",
+        description=(
+            "Find order-irrelevant combos (1–9) with caps, slots, per-length filters, pinned positions, "
+            "multi-sum support, and readable output."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    # Positional sum OR --sums
+    p.add_argument("sum", nargs="?", type=int, help="Target sum (e.g., 23). Omit if using --sums.")
+    p.add_argument("--sums", nargs="*", default=[], help="One or more sums or ranges (e.g., 17 18-20). Overrides positional sum if given.")
+
+    # Lengths OR --len
+    p.add_argument("-l", "--len", dest="lengths", nargs="+", type=int, help="One or more lengths (e.g., -l 2 3 4)")
+
+    # Global / per-length filters
+    p.add_argument("-m", "--must", dest="must", nargs="*", default=[], help="Digits that must appear. Allow L<length>: to target a specific length.")
+    p.add_argument("-x", "--exclude", dest="exclude", nargs="*", default=[], help="Digits to exclude. Allow L<length>: to target a specific length.")
+    p.add_argument("--allowed", nargs="*", default=[], help="Whitelist of digits allowed. Allow L<length>: to target a specific length.")
+
+    # Dupes (global or per-length with L<length>:; per-length can only tighten)
+    p.add_argument("--dupes", dest="dupes", nargs="*", action="append", default=[],
+                   help=("Dup caps: Global N or G:N; per-digit D:C / D1,D2,...:C / A-B:C; 0=exclude; defaults to 1.\n"
+                         "Per-length with L<length>:. Per-length can only TIGHTEN the global caps."))
+    p.add_argument("--allow-dupes", dest="dupes", nargs="*", action="append", help=argparse.SUPPRESS)
+    p.add_argument("-d", dest="dupes", nargs="*", action="append", help=argparse.SUPPRESS)
+
+    # Slots & pins
+    p.add_argument("--slots", nargs="*", action="append", default=[], help="Slot candidates. Single: pos:digits. Multi: L<length>:pos:digits ...")
+    p.add_argument("--pin", nargs="*", action="append", default=[], help="Fix digits at positions. Single length: pos=d. Multi: L<length>:pos=d then pos=d ...")
+
+    # Output & flags
+    p.add_argument("--show-assignment", action="store_true", help="Show one assignment when --slots/--pin is used.")
+    p.add_argument("--all-fits", action="store_true", help="Show ALL assignments (implies --show-assignment).")
+    p.add_argument("--flat", "-f", action="store_true", help="No group headers; flat list (ignored if grouping doesn't apply)." )
+    p.add_argument("--counts-only", action="store_true", help="Only print the number of combos per length.")
+    p.add_argument("--format", choices=["text", "csv", "json"], default="text", help="Output format.")
+    p.add_argument("--color", dest="color", action="store_true", help="Force color on (text)." )
+    p.add_argument("--no-color", dest="no_color", action="store_true", help="Force color off." )
+    p.add_argument("--cage", action="store_true", help="Append cage helper stats per length." )
+    p.add_argument("--explain", action="store_true", help="Print effective constraints per length before results.")
+    p.add_argument("--examples", action="store_true", help="Show usage examples and exit.")
+    p.add_argument("--version", action="store_true", help="Show program version and exit.")
+
+    return p
+
+def show_examples() -> str:
+    return """\
+Examples
+========
+
+Basic:
+  sudoku_perm 15 -l 3
+
+Dupes:
+  sudoku_perm 12 -l 3 --dupes 2
+  sudoku_perm 12 -l 3 --dupes G:3 1,2:2
+  sudoku_perm 12 -l 3 --dupes 2-5:2
+
+Per-length must/exclude/allowed:
+  sudoku_perm 19 -l 3 4 5 --dupes 1 -m 1 L3:3 L4:4 L5:5 -x L3:9 --allowed L3:1-9 L4:1-9 L5:1-9
+
+Slots & assignment:
+  sudoku_perm 12 -l 3 --dupes 2 --slots 1:2,5 2:3-6 3:5,6 --show-assignment
+  sudoku_perm 12 -l 3 --dupes 2 --slots 1:2,5 2:3-6 3:5,6 --all-fits -f
+
+Pinned positions (outside sums):
+  sudoku_perm 19 -l 3 4 5 --dupes 1 --pin L3:1=3 L4:1=4 L5:1=5
+
+Multiple sums:
+  sudoku_perm --sums 17-20 -l 2 3 --dupes 1
+
+Explain constraints:
+  sudoku_perm 23 -l 3 --dupes 2 --explain
+"""
+
+def main() -> None:
+    p = build_parser()
+    args = p.parse_args()
+
+    if args.version:
+        print(__version__)
+        return
+
+    if args.examples:
+        print(show_examples())
+        return
+
+    sums: List[int] = []
+    if args.sums:
+        try:
+            sums = parse_sums_range(args.sums)
+        except Exception as e:
+            print(f"ERROR: {e}", flush=True)
+            raise SystemExit(2)
+    elif args.sum is not None:
+        if args.sum <= 0:
+            print("ERROR: sum must be a positive integer.", flush=True)
+            raise SystemExit(2)
+        sums = [args.sum]
+    else:
+        print("ERROR: Provide a positional sum or use --sums.", flush=True)
+        raise SystemExit(2)
+    if not sums:
+        print("ERROR: No sums provided.", flush=True)
+        raise SystemExit(2)
+
+    # Lengths
+    if not args.lengths:
+        print("ERROR: At least one -l/--len value is required.", flush=True)
+        raise SystemExit(2)
+    lengths = sorted(set(args.lengths))
+    if any(L <= 0 for L in lengths):
+        print("ERROR: All lengths must be positive integers.", flush=True)
+        raise SystemExit(2)
+
+    # Validate sums
+    sums: List[int] = []
+
+    if args.sums:
+        sums = parse_sums_range(args.sums)
+    elif args.sum is not None:
+        if args.sum <= 0:
+            print("ERROR: sum must be a positive integer.", flush=True)
+            raise SystemExit(2)
+        sums = [args.sum]
+    else:
+        print("ERROR: Provide a positional sum or use --sums.", flush=True)
+        raise SystemExit(2)
+
+    lengths = sorted(set(args.lengths))
+    if any(L <= 0 for L in lengths):
+        print("ERROR: All lengths must be positive integers.", flush=True)
+        raise SystemExit(2)
+
+    # Determine color
+    use_color = False
+    if args.format == 'text':
+        if args.color:
+            use_color = True
+        elif args.no_color:
+            use_color = False
+        else:
+            import sys
+            use_color = sys.stdout.isatty()
+
+    # Render per sum with friendly error handling (no raw traceback)
+    try:
+        # Render per sum
+        outputs: List[str] = []
+        multi_sum = len(sums) > 1
+
+        for idx, S in enumerate(sums, start=1):
+            header_prefix = (
+                f"[Group {idx}/{len(sums)}] " 
+                if (multi_sum and args.format == 'text' and not args.flat) else ""
+            )
+            rendered = compute_and_render_for_sum(S, lengths, args, use_color, header_prefix=header_prefix)
+            outputs.append(rendered)
+
+        print("\n".join(outputs))
+        
+    except SystemExit as e:
+        raise
+    except Exception as e:
+        print(f"ERROR: {e}", flush=True)
+        raise SystemExit(1)
+    
+if __name__ == "__main__":
+    main()
