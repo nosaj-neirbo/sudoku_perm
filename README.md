@@ -120,7 +120,7 @@ Prevent digits from appearing.
 Whitelist specific digits (all others disabled).
 
 ```bash
-./sudoku_perm 10 -l 3 --allowed 1,3,5,7,9
+./sudoku_perm 19 -l 3 --allowed 1,3,5,7,9
 ```
 
 ---
